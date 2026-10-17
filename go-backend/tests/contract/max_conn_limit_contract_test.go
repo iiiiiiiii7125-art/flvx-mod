@@ -1,0 +1,605 @@
+package contract_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+
+	"go-backend/internal/auth"
+	"go-backend/internal/http/response"
+	"go-backend/internal/security"
+)
+
+func TestMaxConnLimit(t *testing.T) {
+	secret := "contract-jwt-secret"
+	router, r := setupContractRouter(t, secret)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	adminToken, err := auth.GenerateToken(1, "admin_user", 0, secret)
+	if err != nil {
+		t.Fatalf("generate admin token: %v", err)
+	}
+
+	now := time.Now().UnixMilli()
+	if err := r.DB().Exec(`
+		INSERT INTO tunnel(name, traffic_ratio, type, protocol, flow, created_time, updated_time, status, in_ip, inx)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "max-conn-tunnel", 1.0, 1, "tls", 99999, now, now, 1, nil, 0).Error; err != nil {
+		t.Fatalf("insert tunnel: %v", err)
+	}
+	var tunnelID int64
+	if err := r.DB().Raw("SELECT id FROM tunnel WHERE name = ?", "max-conn-tunnel").Scan(&tunnelID).Error; err != nil {
+		t.Fatalf("get tunnel ID: %v", err)
+	}
+
+	if err := r.DB().Exec(`
+		INSERT INTO node(name, secret, server_ip, server_ip_v4, server_ip_v6, port, interface_name, version, http, tls, socks, created_time, updated_time, status, tcp_listen_addr, udp_listen_addr, inx)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "max-conn-node", "max-conn-secret", "10.20.0.1", "10.20.0.1", "", "32000-32010", "", "v1", 1, 1, 1, now, now, 1, "[::]", "[::]", 0).Error; err != nil {
+		t.Fatalf("insert node: %v", err)
+	}
+	var nodeID int64
+	if err := r.DB().Raw("SELECT id FROM node WHERE name = ?", "max-conn-node").Scan(&nodeID).Error; err != nil {
+		t.Fatalf("get node ID: %v", err)
+	}
+
+	if err := r.DB().Exec(`
+	        INSERT INTO chain_tunnel(tunnel_id, chain_type, node_id, port, strategy, inx, protocol)
+	        VALUES(?, 1, ?, 32001, 'round', 1, 'tls')
+	`, tunnelID, nodeID).Error; err != nil {
+		t.Fatalf("insert chain_tunnel: %v", err)
+	}
+
+	if err := r.DB().Exec(`
+	        INSERT INTO user_tunnel(user_id, tunnel_id, num, flow, in_flow, out_flow, flow_reset_time, exp_time, status)
+	        VALUES(1, ?, 10, 99999, 0, 0, 1, ?, 1)
+	`, tunnelID, now+365*24*3600*1000).Error; err != nil {
+		t.Fatalf("insert user_tunnel: %v", err)
+	}
+
+	var commandMu sync.Mutex
+	receivedCommands := make([]string, 0)
+	var addCLimitersData json.RawMessage
+	var updateCLimitersData json.RawMessage
+
+	stopNode := startMockSessionForMaxConn(t, server.URL, "max-conn-secret", func(cmdType string, data json.RawMessage) (bool, string) {
+		commandMu.Lock()
+		defer commandMu.Unlock()
+		receivedCommands = append(receivedCommands, cmdType)
+
+		if cmdType == "AddCLimiters" {
+			addCLimitersData = append([]byte(nil), data...)
+			return true, "already exists"
+		}
+		if cmdType == "UpdateCLimiters" {
+			updateCLimitersData = append([]byte(nil), data...)
+		}
+
+		return false, ""
+	})
+	defer stopNode()
+
+	waitNodeStatus(t, r, nodeID, 1)
+
+	payload := map[string]interface{}{
+		"name":          "max-conn-forward",
+		"tunnelId":      tunnelID,
+		"remoteAddr":    "1.1.1.1:443",
+		"strategy":      "fifo",
+		"maxConn":       42,
+		"ipMaxConn":     7,
+		"proxyProtocol": 2,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/forward/create", bytes.NewReader(body))
+	req.Header.Set("Authorization", adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+
+	var out response.R
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.Code != 0 {
+		t.Fatalf("expected create success, got code=%d msg=%s", out.Code, out.Msg)
+	}
+
+	var forwardID int64
+	if err := r.DB().Raw("SELECT id FROM forward WHERE name = ?", "max-conn-forward").Scan(&forwardID).Error; err != nil {
+		t.Fatalf("get forward ID: %v", err)
+	}
+
+	listOut := requestContractEnvelope(t, router, adminToken, "/api/v1/forward/list", nil)
+	if listOut.Code != 0 {
+		t.Fatalf("expected /forward/list success, got code=%d msg=%s", listOut.Code, listOut.Msg)
+	}
+
+	rows := mustContractSlice(t, listOut.Data, "forward list")
+	var target map[string]interface{}
+	for _, row := range rows {
+		item, ok := row.(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected forward item to be object, got %T", row)
+		}
+		idVal, ok := item["id"].(float64)
+		if !ok {
+			t.Fatalf("expected forward id to be float64, got %T", item["id"])
+		}
+		if int64(idVal) == forwardID {
+			target = item
+			break
+		}
+	}
+	if target == nil {
+		t.Fatalf("forward %d not found in /forward/list response", forwardID)
+	}
+
+	maxConnVal, ok := target["maxConn"].(float64)
+	if !ok {
+		t.Fatalf("expected maxConn to be float64, got %T (%v)", target["maxConn"], target["maxConn"])
+	}
+	if int(maxConnVal) != 42 {
+		t.Fatalf("expected maxConn 42 in /forward/list, got %v", maxConnVal)
+	}
+
+	proxyProtocolVal, ok := target["proxyProtocol"].(float64)
+	if !ok {
+		t.Fatalf("expected proxyProtocol to be float64, got %T (%v)", target["proxyProtocol"], target["proxyProtocol"])
+	}
+	if int(proxyProtocolVal) != 2 {
+		t.Fatalf("expected proxyProtocol 2 in /forward/list, got %v", proxyProtocolVal)
+	}
+
+	commandMu.Lock()
+	defer commandMu.Unlock()
+
+	hasAdd := false
+	hasUpdate := false
+	for _, cmd := range receivedCommands {
+		if cmd == "AddCLimiters" {
+			hasAdd = true
+		}
+		if cmd == "UpdateCLimiters" {
+			hasUpdate = true
+		}
+	}
+
+	if !hasAdd {
+		t.Fatalf("expected AddCLimiters to be sent, but it was not. Received: %v", receivedCommands)
+	}
+	if !hasUpdate {
+		t.Fatalf("expected UpdateCLimiters to be sent after AddCLimiters failed with already exists. Received: %v", receivedCommands)
+	}
+
+	expectedName := fmt.Sprintf("rule_conn_limit_%d", forwardID)
+
+	// verify payload for AddCLimiters
+	var addData map[string]interface{}
+	if err := json.Unmarshal(addCLimitersData, &addData); err != nil {
+		t.Fatalf("unmarshal AddCLimiters data: %v", err)
+	}
+	if addData["name"] != expectedName {
+		t.Fatalf("expected limiter name %s, got %v", expectedName, addData["name"])
+	}
+	if limits, ok := addData["limits"].([]interface{}); ok {
+		if len(limits) != 2 || limits[0] != "$ 42" || limits[1] != "$$ 7" {
+			t.Fatalf("expected limits to contain '$ 42' and '$$ 7', got %v", limits)
+		}
+	} else {
+		t.Fatalf("invalid limits type in AddCLimiters data: %v", addData)
+	}
+
+	// verify payload for UpdateCLimiters
+	var updateData map[string]interface{}
+	if err := json.Unmarshal(updateCLimitersData, &updateData); err != nil {
+		t.Fatalf("unmarshal UpdateCLimiters data: %v", err)
+	}
+	if updateData["limiter"] != expectedName {
+		t.Fatalf("expected update limiter name %s, got %v", expectedName, updateData["limiter"])
+	}
+	nestedData, ok := updateData["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected nested 'data' in UpdateCLimiters, got %v", updateData)
+	}
+	if nestedData["name"] != expectedName {
+		t.Fatalf("expected nested name %s, got %v", expectedName, nestedData["name"])
+	}
+	if nestedLimits, ok := nestedData["limits"].([]interface{}); ok {
+		if len(nestedLimits) != 2 || nestedLimits[0] != "$ 42" || nestedLimits[1] != "$$ 7" {
+			t.Fatalf("expected nested limits to contain '$ 42' and '$$ 7', got %v", nestedLimits)
+		}
+	} else {
+		t.Fatalf("invalid limits type in UpdateCLimiters nested data: %v", nestedData)
+	}
+}
+
+func TestUserMaxConnUpdateResyncsExistingForwards(t *testing.T) {
+	secret := "contract-jwt-secret"
+	router, r := setupContractRouter(t, secret)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	adminToken, err := auth.GenerateToken(1, "admin_user", 0, secret)
+	if err != nil {
+		t.Fatalf("generate admin token: %v", err)
+	}
+
+	now := time.Now().UnixMilli()
+	if err := r.DB().Exec(`
+		INSERT INTO user(id, user, pwd, role_id, exp_time, flow, in_flow, out_flow, flow_reset_time, num, max_conn, created_time, updated_time, status)
+		VALUES(2, 'limited_user', 'pwd', 1, ?, 99999, 0, 0, 1, 10, 0, ?, ?, 1)
+	`, now+365*24*3600*1000, now, now).Error; err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO tunnel(id, name, traffic_ratio, type, protocol, flow, created_time, updated_time, status, in_ip, inx)
+		VALUES(10, 'user-max-conn-tunnel', 1.0, 1, 'tls', 99999, ?, ?, 1, NULL, 0)
+	`, now, now).Error; err != nil {
+		t.Fatalf("insert tunnel: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO node(id, name, secret, server_ip, server_ip_v4, server_ip_v6, port, interface_name, version, http, tls, socks, created_time, updated_time, status, tcp_listen_addr, udp_listen_addr, inx)
+		VALUES(20, 'user-max-conn-node', 'user-max-conn-secret', '10.21.0.1', '10.21.0.1', '', '32100-32110', '', 'v1', 1, 1, 1, ?, ?, 1, '[::]', '[::]', 0)
+	`, now, now).Error; err != nil {
+		t.Fatalf("insert node: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO chain_tunnel(tunnel_id, chain_type, node_id, port, strategy, inx, protocol)
+		VALUES(10, 1, 20, 32101, 'round', 1, 'tls')
+	`).Error; err != nil {
+		t.Fatalf("insert chain_tunnel: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO user_tunnel(id, user_id, tunnel_id, num, flow, in_flow, out_flow, flow_reset_time, exp_time, status)
+		VALUES(30, 2, 10, 10, 99999, 0, 0, 1, ?, 1)
+	`, now+365*24*3600*1000).Error; err != nil {
+		t.Fatalf("insert user_tunnel: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO forward(id, user_id, user_name, name, tunnel_id, remote_addr, strategy, in_flow, out_flow, created_time, updated_time, status, inx, max_conn)
+		VALUES(40, 2, 'limited_user', 'user-max-conn-forward', 10, '1.1.1.1:443', 'fifo', 0, 0, ?, ?, 1, 0, 0)
+	`, now, now).Error; err != nil {
+		t.Fatalf("insert forward: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO forward_port(forward_id, node_id, port, in_ip)
+		VALUES(40, 20, 32105, '')
+	`).Error; err != nil {
+		t.Fatalf("insert forward_port: %v", err)
+	}
+
+	var commandMu sync.Mutex
+	receivedCommands := make([]string, 0)
+	var addCLimitersData json.RawMessage
+	var updateServiceData json.RawMessage
+
+	stopNode := startMockSessionForMaxConn(t, server.URL, "user-max-conn-secret", func(cmdType string, data json.RawMessage) (bool, string) {
+		commandMu.Lock()
+		defer commandMu.Unlock()
+		receivedCommands = append(receivedCommands, cmdType)
+		if cmdType == "AddCLimiters" {
+			addCLimitersData = append([]byte(nil), data...)
+		}
+		if cmdType == "UpdateService" {
+			updateServiceData = append([]byte(nil), data...)
+		}
+		return false, ""
+	})
+	defer stopNode()
+
+	waitNodeStatus(t, r, 20, 1)
+
+	payload := map[string]interface{}{
+		"id":            2,
+		"user":          "limited_user",
+		"flow":          99999,
+		"num":           10,
+		"expTime":       now + 365*24*3600*1000,
+		"flowResetTime": 1,
+		"status":        1,
+		"maxConn":       37,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/user/update", bytes.NewReader(body))
+	req.Header.Set("Authorization", adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+
+	var out response.R
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.Code != 0 {
+		t.Fatalf("expected user update success, got code=%d msg=%s", out.Code, out.Msg)
+	}
+
+	commandMu.Lock()
+	defer commandMu.Unlock()
+	if addCLimitersData == nil {
+		t.Fatalf("expected AddCLimiters after user maxConn update. Received: %v", receivedCommands)
+	}
+	if updateServiceData == nil {
+		t.Fatalf("expected UpdateService after user maxConn update. Received: %v", receivedCommands)
+	}
+
+	var addData map[string]interface{}
+	if err := json.Unmarshal(addCLimitersData, &addData); err != nil {
+		t.Fatalf("unmarshal AddCLimiters data: %v", err)
+	}
+	if addData["name"] != "user_conn_limit_2" {
+		t.Fatalf("expected limiter name user_conn_limit_2, got %v", addData["name"])
+	}
+	limits, ok := addData["limits"].([]interface{})
+	if !ok || len(limits) != 1 || limits[0] != "$ 37" {
+		t.Fatalf("expected limits to contain '$ 37', got %v", addData["limits"])
+	}
+
+	var services []map[string]interface{}
+	if err := json.Unmarshal(updateServiceData, &services); err != nil {
+		t.Fatalf("unmarshal UpdateService data: %v", err)
+	}
+	if len(services) != 2 {
+		t.Fatalf("expected 2 services, got %d", len(services))
+	}
+	for _, service := range services {
+		if service["climiter"] != "user_conn_limit_2" {
+			t.Fatalf("expected service climiter user_conn_limit_2, got %v", service["climiter"])
+		}
+	}
+}
+
+func TestUserMaxConnWithPerIPRuleSplitsRuntimeLimiters(t *testing.T) {
+	secret := "contract-jwt-secret"
+	router, r := setupContractRouter(t, secret)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	userToken, err := auth.GenerateToken(3, "per_ip_user", 1, secret)
+	if err != nil {
+		t.Fatalf("generate user token: %v", err)
+	}
+
+	now := time.Now().UnixMilli()
+	if err := r.DB().Exec(`
+		INSERT INTO user(id, user, pwd, role_id, exp_time, flow, in_flow, out_flow, flow_reset_time, num, max_conn, created_time, updated_time, status)
+		VALUES(3, 'per_ip_user', 'pwd', 1, ?, 99999, 0, 0, 1, 10, 37, ?, ?, 1)
+	`, now+365*24*3600*1000, now, now).Error; err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO tunnel(id, name, traffic_ratio, type, protocol, flow, created_time, updated_time, status, in_ip, inx)
+		VALUES(11, 'user-per-ip-conn-tunnel', 1.0, 1, 'tls', 99999, ?, ?, 1, NULL, 0)
+	`, now, now).Error; err != nil {
+		t.Fatalf("insert tunnel: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO node(id, name, secret, server_ip, server_ip_v4, server_ip_v6, port, interface_name, version, http, tls, socks, created_time, updated_time, status, tcp_listen_addr, udp_listen_addr, inx)
+		VALUES(21, 'user-per-ip-conn-node', 'user-per-ip-conn-secret', '10.23.0.1', '10.23.0.1', '', '32300-32310', '', 'v1', 1, 1, 1, ?, ?, 1, '[::]', '[::]', 0)
+	`, now, now).Error; err != nil {
+		t.Fatalf("insert node: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO chain_tunnel(tunnel_id, chain_type, node_id, port, strategy, inx, protocol)
+		VALUES(11, 1, 21, 32301, 'round', 1, 'tls')
+	`).Error; err != nil {
+		t.Fatalf("insert chain_tunnel: %v", err)
+	}
+	if err := r.DB().Exec(`
+		INSERT INTO user_tunnel(id, user_id, tunnel_id, num, flow, in_flow, out_flow, flow_reset_time, exp_time, status)
+		VALUES(31, 3, 11, 10, 99999, 0, 0, 1, ?, 1)
+	`, now+365*24*3600*1000).Error; err != nil {
+		t.Fatalf("insert user_tunnel: %v", err)
+	}
+
+	var commandMu sync.Mutex
+	receivedCommands := make([]string, 0)
+	addCLimitersData := make([]json.RawMessage, 0)
+	var updateServiceData json.RawMessage
+
+	stopNode := startMockSessionForMaxConn(t, server.URL, "user-per-ip-conn-secret", func(cmdType string, data json.RawMessage) (bool, string) {
+		commandMu.Lock()
+		defer commandMu.Unlock()
+		receivedCommands = append(receivedCommands, cmdType)
+		if cmdType == "AddCLimiters" {
+			addCLimitersData = append(addCLimitersData, append([]byte(nil), data...))
+		}
+		if cmdType == "UpdateService" {
+			updateServiceData = append([]byte(nil), data...)
+		}
+		return false, ""
+	})
+	defer stopNode()
+
+	waitNodeStatus(t, r, 21, 1)
+
+	payload := map[string]interface{}{
+		"name":       "user-per-ip-conn-forward",
+		"tunnelId":   int64(11),
+		"remoteAddr": "1.1.1.1:443",
+		"strategy":   "fifo",
+		"ipMaxConn":  7,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/forward/create", bytes.NewReader(body))
+	req.Header.Set("Authorization", userToken)
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+
+	var out response.R
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.Code != 0 {
+		t.Fatalf("expected create success, got code=%d msg=%s", out.Code, out.Msg)
+	}
+
+	var forwardID int64
+	if err := r.DB().Raw("SELECT id FROM forward WHERE name = ?", "user-per-ip-conn-forward").Scan(&forwardID).Error; err != nil {
+		t.Fatalf("get forward ID: %v", err)
+	}
+	expectedRuleName := fmt.Sprintf("rule_conn_limit_%d", forwardID)
+
+	commandMu.Lock()
+	defer commandMu.Unlock()
+	if len(addCLimitersData) != 2 {
+		t.Fatalf("expected two AddCLimiters commands. Received: %v", receivedCommands)
+	}
+	if updateServiceData == nil {
+		t.Fatalf("expected UpdateService. Received: %v", receivedCommands)
+	}
+
+	gotLimits := make(map[string][]string)
+	for _, raw := range addCLimitersData {
+		var data map[string]interface{}
+		if err := json.Unmarshal(raw, &data); err != nil {
+			t.Fatalf("unmarshal AddCLimiters data: %v", err)
+		}
+		limits, ok := data["limits"].([]interface{})
+		if !ok {
+			t.Fatalf("expected limits array, got %T", data["limits"])
+		}
+		for _, limit := range limits {
+			gotLimits[fmt.Sprint(data["name"])] = append(gotLimits[fmt.Sprint(data["name"])], fmt.Sprint(limit))
+		}
+	}
+	if !reflect.DeepEqual(gotLimits["user_conn_limit_3"], []string{"$ 37"}) {
+		t.Fatalf("expected user max limiter payload, got %v", gotLimits["user_conn_limit_3"])
+	}
+	if !reflect.DeepEqual(gotLimits[expectedRuleName], []string{"$$ 7"}) {
+		t.Fatalf("expected rule per-IP limiter payload, got %v", gotLimits[expectedRuleName])
+	}
+
+	var services []map[string]interface{}
+	if err := json.Unmarshal(updateServiceData, &services); err != nil {
+		t.Fatalf("unmarshal UpdateService data: %v", err)
+	}
+	expectedCLimiter := "user_conn_limit_3," + expectedRuleName
+	for _, service := range services {
+		if service["climiter"] != expectedCLimiter {
+			t.Fatalf("expected service climiter %s, got %v", expectedCLimiter, service["climiter"])
+		}
+	}
+}
+
+func startMockSessionForMaxConn(t *testing.T, baseURL string, nodeSecret string, onCommand func(cmdType string, data json.RawMessage) (bool, string)) func() {
+	t.Helper()
+
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		t.Fatalf("parse provider url: %v", err)
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		u.Scheme = "wss"
+	} else {
+		u.Scheme = "ws"
+	}
+	u.Path = "/system-info"
+	q := u.Query()
+	q.Set("type", "1")
+	q.Set("secret", nodeSecret)
+	q.Set("version", "v1")
+	q.Set("http", "1")
+	q.Set("tls", "1")
+	q.Set("socks", "1")
+	u.RawQuery = q.Encode()
+
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		t.Fatalf("dial mock node websocket: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			_, raw, readErr := conn.ReadMessage()
+			if readErr != nil {
+				return
+			}
+
+			plain := raw
+			var wrap struct {
+				Encrypted bool   `json:"encrypted"`
+				Data      string `json:"data"`
+			}
+			if err := json.Unmarshal(raw, &wrap); err == nil && wrap.Encrypted && strings.TrimSpace(wrap.Data) != "" {
+				crypto, cryptoErr := security.NewAESCrypto(nodeSecret)
+				if cryptoErr == nil {
+					if dec, decErr := crypto.Decrypt(wrap.Data); decErr == nil {
+						plain = []byte(dec)
+					}
+				}
+			}
+
+			var cmd struct {
+				Type      string          `json:"type"`
+				RequestID string          `json:"requestId"`
+				Data      json.RawMessage `json:"data"`
+			}
+			if err := json.Unmarshal(plain, &cmd); err != nil {
+				continue
+			}
+			if strings.TrimSpace(cmd.RequestID) == "" {
+				continue
+			}
+
+			shouldFail := false
+			failMsg := ""
+			if onCommand != nil {
+				shouldFail, failMsg = onCommand(strings.TrimSpace(cmd.Type), cmd.Data)
+			}
+
+			respType := fmt.Sprintf("%sResponse", cmd.Type)
+			respPayload := map[string]interface{}{
+				"type":      respType,
+				"success":   !shouldFail,
+				"message":   "OK",
+				"requestId": cmd.RequestID,
+			}
+			if shouldFail {
+				if strings.TrimSpace(failMsg) == "" {
+					failMsg = "mock command failed"
+				}
+				respPayload["message"] = failMsg
+			}
+
+			respBytes, err := json.Marshal(respPayload)
+			if err != nil {
+				continue
+			}
+			_ = conn.WriteMessage(websocket.TextMessage, respBytes)
+		}
+	}()
+
+	var stopOnce sync.Once
+	return func() {
+		stopOnce.Do(func() {
+			_ = conn.Close()
+			wg.Wait()
+		})
+	}
+}

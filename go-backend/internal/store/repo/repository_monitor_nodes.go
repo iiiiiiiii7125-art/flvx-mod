@@ -1,0 +1,80 @@
+package repo
+
+import (
+	"errors"
+
+	"go-backend/internal/store/model"
+)
+
+func (r *Repository) ListMonitorNodes() ([]model.Node, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var nodes []model.Node
+	err := r.db.Select("id", "inx", "name", "status", "version", "updated_time").
+		Where("is_remote = ?", 0).
+		Order("inx ASC, id ASC").
+		Find(&nodes).Error
+	return nodes, err
+}
+
+// ListNodesWithExpiry returns local nodes that have an expiry time set.
+func (r *Repository) ListNodesWithExpiry() ([]model.Node, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var nodes []model.Node
+	err := r.db.Select("id", "name", "expiry_time", "renewal_cycle", "expiry_reminder_dismissed").
+		Where("is_remote = ? AND expiry_time IS NOT NULL AND expiry_time > 0", 0).
+		Order("id ASC").
+		Find(&nodes).Error
+	return nodes, err
+}
+
+// ListUsersForNotify returns the fields the quota and expiry reminders need.
+func (r *Repository) ListUsersForNotify() ([]model.User, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var users []model.User
+	err := r.db.Select("id", "user", "role_id", "status", "exp_time", "flow", "flow_mib", "in_flow", "out_flow").
+		Order("id ASC").Find(&users).Error
+	return users, err
+}
+
+// SumStatisticsFlowSince adds up the hourly forward traffic increments
+// recorded since the given time (unix ms).
+func (r *Repository) SumStatisticsFlowSince(sinceMs int64) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("repository not initialized")
+	}
+	var total int64
+	err := r.db.Model(&model.StatisticsFlow{}).Where("created_time >= ?", sinceMs).
+		Select("COALESCE(SUM(flow), 0)").Scan(&total).Error
+	return total, err
+}
+
+// SumInboundTraffic returns the cumulative traffic of all inbounds.
+func (r *Repository) SumInboundTraffic() (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("repository not initialized")
+	}
+	var total int64
+	err := r.db.Model(&model.NodeInbound{}).Select("COALESCE(SUM(upload_bytes + download_bytes), 0)").Scan(&total).Error
+	return total, err
+}
+
+// CountNodesOnline returns (online, total) for local nodes.
+func (r *Repository) CountNodesOnline() (int64, int64, error) {
+	if r == nil || r.db == nil {
+		return 0, 0, errors.New("repository not initialized")
+	}
+	var total, online int64
+	if err := r.db.Model(&model.Node{}).Where("is_remote = ?", 0).Count(&total).Error; err != nil {
+		return 0, 0, err
+	}
+	if err := r.db.Model(&model.Node{}).Where("is_remote = ? AND status = ?", 0, 1).Count(&online).Error; err != nil {
+		return 0, 0, err
+	}
+	return online, total, nil
+}

@@ -1,0 +1,122 @@
+name: CI Build Check
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+jobs:
+  install-scripts:
+    name: Test Installer Scripts (systemd and Alpine OpenRC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run installer regression tests
+        run: bash test-install-scripts-proxy.sh
+
+      - name: Test Alpine bootstrap and OpenRC lifecycle
+        run: docker run --rm -v "$PWD:/workspace:ro" alpine:3.22 sh /workspace/test-install-scripts-alpine.sh
+
+  frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vite-frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.0'
+
+      - name: Install pnpm
+        run: npm install -g pnpm@10.28.1
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+  backend:
+    name: Build Go Backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go-backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: go-backend/go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        run: go build -v ./...
+
+  backend-postgres-contract:
+    name: Go Backend PostgreSQL Contract
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: flux_test
+          POSTGRES_PASSWORD: flux_test_pass
+          POSTGRES_DB: flux_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U flux_test -d flux_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: go-backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: go-backend/go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run PostgreSQL contract test
+        env:
+          FLVX_POSTGRES_TEST_DSN: 'postgres://flux_test:flux_test_pass@127.0.0.1:5432/flux_test?sslmode=disable'
+        run: go test ./tests/contract -run TestPostgresNodeCreateRepairsMissingIDDefaultContract -count=1
+
+  agent:
+    name: Build Agent
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go-gost
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: go-gost/go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        run: go build -v .

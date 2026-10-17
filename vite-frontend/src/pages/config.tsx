@@ -1,0 +1,2006 @@
+import type {
+  SystemUpgradeCheckApiData,
+  SystemUpgradeReleaseApiItem,
+  SystemUpgradeVersionApiData,
+} from "@/api/types";
+
+import { useState, useEffect, useRef } from "react";
+import { useNavigate } from "react-router-dom";
+import { AnimatePresence, motion } from "framer-motion";
+import toast from "react-hot-toast";
+
+import { Button } from "@/shadcn-bridge/heroui/button";
+import { Card, CardBody, CardHeader } from "@/shadcn-bridge/heroui/card";
+import { Input } from "@/shadcn-bridge/heroui/input";
+import { Textarea } from "@/shadcn-bridge/heroui/input";
+import { Spinner } from "@/shadcn-bridge/heroui/spinner";
+import { Divider } from "@/shadcn-bridge/heroui/divider";
+import { Switch } from "@/shadcn-bridge/heroui/switch";
+import { Select, SelectItem } from "@/shadcn-bridge/heroui/select";
+import { Checkbox } from "@/shadcn-bridge/heroui/checkbox";
+import {
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+} from "@/shadcn-bridge/heroui/modal";
+import {
+  updateConfigs,
+  exportBackup,
+  importBackup,
+  getAnnouncement,
+  updateAnnouncement,
+  getStorageSummary,
+  getSystemUpgradeVersion,
+  checkSystemUpgrade,
+  runSystemUpgrade,
+  type AnnouncementData,
+} from "@/api";
+import { BackIcon, SettingsIcon } from "@/components/icons";
+import { NotifyCard } from "@/pages/config/notify-card";
+import { ThemeSettings } from "@/components/theme-settings";
+import { isAdmin } from "@/utils/auth";
+import { getCachedConfigs, configCache, updateSiteConfig } from "@/config/site";
+import {
+  DEFAULT_TUNNEL_QUALITY_INTERVAL_SEC,
+  MAX_TUNNEL_QUALITY_INTERVAL_SEC,
+  MIN_TUNNEL_QUALITY_INTERVAL_SEC,
+  parseTunnelQualityIntervalSeconds,
+  TUNNEL_QUALITY_INTERVAL_CONFIG_KEY,
+  validateTunnelQualityInterval,
+} from "@/config/tunnel-quality";
+import {
+  type UpdateReleaseChannel,
+  getUpdateReleaseChannel,
+} from "@/utils/version-update";
+import {
+  convertBrandAssetToPngDataURL,
+  isPngDataURL,
+  type BrandAssetKind,
+} from "@/utils/brand-asset";
+
+// 简单的保存图标组件
+const SaveIcon = ({ className }: { className?: string }) => (
+  <svg
+    className={className}
+    fill="none"
+    stroke="currentColor"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    strokeWidth="2"
+    viewBox="0 0 24 24"
+  >
+    <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+    <polyline points="17,21 17,13 7,13 7,21" />
+    <polyline points="7,3 7,8 15,8" />
+  </svg>
+);
+
+interface ConfigItem {
+  key: string;
+  label: string;
+  placeholder?: string;
+  description?: string;
+  type: "input" | "switch" | "select" | "bg_image";
+  options?: { label: string; value: string; description?: string }[];
+  dependsOn?: string; // 依赖的配置项key
+  dependsValue?: string; // 依赖的配置项值
+}
+
+type BgImageKey =
+  | "app_bg_image"
+  | "app_bg_image_light"
+  | "app_bg_image_dark"
+  | "login_bg_image";
+
+const BRAND_PREVIEW_KEYS = ["app_logo", "app_favicon"] as const;
+
+type BrandPreviewKey = (typeof BRAND_PREVIEW_KEYS)[number];
+
+const isBrandPreviewKey = (key: string): key is BrandPreviewKey =>
+  BRAND_PREVIEW_KEYS.includes(key as BrandPreviewKey);
+
+const BRAND_FILE_ACCEPT = "image/png,image/jpeg,image/webp,image/svg+xml";
+
+const toBrandAssetKind = (key: BrandPreviewKey): BrandAssetKind => {
+  return key === "app_logo" ? "logo" : "favicon";
+};
+
+// 网站配置项定义
+const CONFIG_ITEMS: ConfigItem[] = [
+  {
+    key: "app_bg_image",
+    label: "主界面壁纸",
+    description:
+      "登录后主界面的背景。默认背景用于未单独设置壁纸的模式。可分别上传亮色和暗色壁纸，保存后随外观模式自动切换。",
+    type: "bg_image",
+  },
+  {
+    key: "login_bg_image",
+    label: "登录页壁纸",
+    description: "登录界面的背景壁纸，留空则跟随主界面壁纸。",
+    type: "bg_image",
+  },
+  {
+    key: "ip",
+    label: "面板后端地址",
+    placeholder: "请输入面板后端IP:PORT",
+    description:
+      '格式"ip:port"或"domain:port",用于对接节点时使用。支持套CDN和HTTPS,通讯数据有加密',
+    type: "input",
+  },
+  {
+    key: "panel_domain",
+    label: "面板域名",
+    placeholder: "请输入面板域名",
+    description: "当前面板的域名，用于与其他面板进行联邦共享时验证身份",
+    type: "input",
+  },
+  {
+    key: "app_name",
+    label: "应用名称",
+    placeholder: "请输入应用名称",
+    description: "在浏览器标签页和导航栏显示的应用名称",
+    type: "input",
+  },
+  {
+    key: "app_logo",
+    label: "网页角标 Logo",
+    description: "用于页面左上角导航角标，上传后会自动转换为 PNG 并持久化保存",
+    type: "input",
+  },
+  {
+    key: "app_favicon",
+    label: "浏览器缩略图标",
+    description: "用于浏览器标签页图标，上传后会自动转换为 PNG 并持久化保存",
+    type: "input",
+  },
+  {
+    key: "hide_footer_brand",
+    label: "隐藏页面底部 FLVX 版权信息",
+    description: "开启后页面底部不再显示 Powered by FLVX",
+    type: "switch",
+  },
+  {
+    key: "forward_compact_mode",
+    label: "规则页面精简模式",
+    description: "开启后，规则页面列表使用 2.1.6-alpha8 样式（全局配置）",
+    type: "switch",
+  },
+  {
+    key: "monitor_tunnel_quality_enabled",
+    label: "实时隧道质量检测",
+    description:
+      "关闭后，前端停止自动刷新，后端停止实时隧道质量探测（全局配置）",
+    type: "switch",
+  },
+  {
+    key: TUNNEL_QUALITY_INTERVAL_CONFIG_KEY,
+    label: "隧道质量探测间隔",
+    placeholder: String(DEFAULT_TUNNEL_QUALITY_INTERVAL_SEC),
+    description:
+      "设置实时隧道质量检测的执行频率，单位为秒；允许 1–3600 秒，默认 1 秒。",
+    type: "input",
+    dependsOn: "monitor_tunnel_quality_enabled",
+    dependsValue: "true",
+  },
+  {
+    key: "monitor_retention_days",
+    label: "监控数据保留天数",
+    placeholder: "7",
+    description:
+      "统一清理节点指标、隧道流量、服务监控结果和隧道质量历史；默认 7 天。",
+    type: "input",
+  },
+  {
+    key: "captcha_enabled",
+    label: "启用验证码",
+    description: "开启后，用户登录时需要完成验证码验证",
+    type: "switch",
+  },
+  {
+    key: "cloudflare_site_key",
+    label: "Cloudflare Site Key",
+    placeholder: "请输入 Cloudflare Site Key",
+    description: "Cloudflare Turnstile 站点密钥",
+    type: "input",
+    dependsOn: "captcha_enabled",
+    dependsValue: "true",
+  },
+  {
+    key: "cloudflare_secret_key",
+    label: "Cloudflare Secret Key",
+    placeholder: "请输入 Cloudflare Secret Key",
+    description: "Cloudflare Turnstile 密钥",
+    type: "input",
+    dependsOn: "captcha_enabled",
+    dependsValue: "true",
+  },
+  {
+    key: "github_proxy_enabled",
+    label: "开启 GitHub 加速",
+    description: "用于节点更新和安装脚本下载，解决部分地区 GitHub 访问受限问题",
+    type: "switch",
+  },
+  {
+    key: "github_proxy_url",
+    label: "加速地址",
+    placeholder: "https://gcode.hostcentral.cc",
+    description: "GitHub 下载加速代理地址，开启加速后生效",
+    type: "input",
+    dependsOn: "github_proxy_enabled",
+    dependsValue: "true",
+  },
+  {
+    key: "allow_local_remote_addr",
+    label: "允许转发到本地地址",
+    description:
+      "开启后，普通用户创建或编辑规则时可将目标地址指向 127.0.0.1、10.x.x.x、172.16-31.x.x、192.168.x.x 等本地或内网地址。默认关闭以降低开放代理风险。",
+    type: "switch",
+  },
+];
+
+const BACKUP_TYPE_OPTIONS = [
+  { value: "users", label: "用户" },
+  { value: "nodes", label: "节点" },
+  { value: "tunnels", label: "隧道" },
+  { value: "forwards", label: "规则" },
+  { value: "userTunnels", label: "用户隧道权限" },
+  { value: "speedLimits", label: "限速规则" },
+  { value: "tunnelGroups", label: "隧道分组" },
+  { value: "userGroups", label: "用户分组" },
+  { value: "permissions", label: "分组权限" },
+  { value: "configs", label: "系统配置" },
+  { value: "inbounds", label: "内核与入站" },
+] as const;
+
+const BACKUP_TYPE_VALUES = BACKUP_TYPE_OPTIONS.map((option) => option.value);
+
+// 初始化时从缓存读取配置，避免闪烁
+const getInitialConfigs = (): Record<string, string> => {
+  if (typeof window === "undefined") return {};
+
+  const configKeys = [
+    "app_name",
+    "captcha_enabled",
+    "cloudflare_site_key",
+    "cloudflare_secret_key",
+    "forward_compact_mode",
+    "monitor_tunnel_quality_enabled",
+    TUNNEL_QUALITY_INTERVAL_CONFIG_KEY,
+    "monitor_retention_days",
+    "ip",
+    "panel_domain",
+    "app_logo",
+    "app_favicon",
+    "app_bg_image",
+    "app_bg_image_light",
+    "app_bg_image_dark",
+    "login_bg_image",
+    "github_proxy_enabled",
+    "github_proxy_url",
+    "allow_local_remote_addr",
+    "hide_footer_brand",
+  ];
+  const initialConfigs: Record<string, string> = {};
+
+  try {
+    configKeys.forEach((key) => {
+      const cachedValue = localStorage.getItem("vite_config_" + key);
+
+      if (cachedValue) {
+        initialConfigs[key] = cachedValue;
+      }
+    });
+  } catch {}
+
+  return initialConfigs;
+};
+
+export default function ConfigPage() {
+  const navigate = useNavigate();
+  const initialConfigs = getInitialConfigs();
+  const [configs, setConfigs] =
+    useState<Record<string, string>>(initialConfigs);
+  const [loading, setLoading] = useState(
+    Object.keys(initialConfigs).length === 0,
+  );
+  const [saving, setSaving] = useState(false);
+  const [hasChanges, setHasChanges] = useState(false);
+  const [originalConfigs, setOriginalConfigs] =
+    useState<Record<string, string>>(initialConfigs);
+
+  const [exportTypes, setExportTypes] = useState<string[]>([]);
+  const [importTypes, setImportTypes] = useState<string[]>([]);
+  const [exporting, setExporting] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [exportSelectorOpen, setExportSelectorOpen] = useState(false);
+  const [importSelectorOpen, setImportSelectorOpen] = useState(false);
+  const [importFileName, setImportFileName] = useState("");
+  const backupFileInputRef = useRef<HTMLInputElement>(null);
+
+  const logoFileInputRef = useRef<HTMLInputElement>(null);
+  const faviconFileInputRef = useRef<HTMLInputElement>(null);
+  const bgImageFileInputRefs = useRef<
+    Partial<Record<BgImageKey, HTMLInputElement>>
+  >({});
+  const [bgImageUploading, setBgImageUploading] = useState<BgImageKey | null>(
+    null,
+  );
+
+  const [announcement, setAnnouncement] = useState<AnnouncementData>({
+    content: "",
+    enabled: 0,
+  });
+  const [announcementLoading, setAnnouncementLoading] = useState(true);
+  const [announcementSaving, setAnnouncementSaving] = useState(false);
+  const updateChannel: UpdateReleaseChannel = getUpdateReleaseChannel();
+  const [systemUpgradeInfo, setSystemUpgradeInfo] =
+    useState<SystemUpgradeVersionApiData | null>(null);
+  const [systemUpgradeChecking, setSystemUpgradeChecking] = useState(false);
+  const [systemUpgradeExecuting, setSystemUpgradeExecuting] = useState(false);
+  const [systemUpgradeLoading, setSystemUpgradeLoading] = useState(true);
+  const [systemUpgradeModalOpen, setSystemUpgradeModalOpen] = useState(false);
+  const [systemUpgradeReleases, setSystemUpgradeReleases] = useState<
+    SystemUpgradeReleaseApiItem[]
+  >([]);
+  const [systemUpgradeCheckedChannel, setSystemUpgradeCheckedChannel] =
+    useState<UpdateReleaseChannel | null>(null);
+  const [systemUpgradeSelectedVersion, setSystemUpgradeSelectedVersion] =
+    useState("");
+  const [previewLoadFailed, setPreviewLoadFailed] = useState<
+    Partial<Record<BrandPreviewKey, boolean>>
+  >({});
+  const [brandUploading, setBrandUploading] = useState<
+    Partial<Record<BrandPreviewKey, boolean>>
+  >({});
+  const [storageSummary, setStorageSummary] = useState("加载中...");
+  const systemUpgradeReleasesMatchChannel =
+    systemUpgradeCheckedChannel === updateChannel;
+  const systemUpgradeHasConfirmedUpdate = Boolean(
+    systemUpgradeInfo?.hasUpdate &&
+      systemUpgradeReleasesMatchChannel &&
+      systemUpgradeReleases.length > 0,
+  );
+  const canTriggerSystemUpgrade = Boolean(
+    !systemUpgradeLoading &&
+      !systemUpgradeChecking &&
+      !systemUpgradeExecuting &&
+      systemUpgradeInfo?.capability.capable !== false,
+  );
+  const canOpenSystemUpgradeModal = Boolean(
+    systemUpgradeInfo?.capability.capable &&
+      systemUpgradeHasConfirmedUpdate &&
+      !systemUpgradeLoading &&
+      !systemUpgradeChecking &&
+      !systemUpgradeExecuting,
+  );
+
+  const canGoBack =
+    typeof window !== "undefined" &&
+    typeof window.history.state?.idx === "number" &&
+    window.history.state.idx > 0;
+
+  const handleBack = () => {
+    if (canGoBack) {
+      navigate(-1);
+
+      return;
+    }
+
+    navigate("/profile", { replace: true });
+  };
+
+  // 权限检查
+  useEffect(() => {
+    if (!isAdmin()) {
+      toast.error("权限不足，只有管理员可以访问此页面");
+      navigate("/dashboard", { replace: true });
+
+      return;
+    }
+  }, [navigate]);
+
+  // 加载配置数据（优先从缓存）
+  const loadConfigs = async (currentConfigs?: Record<string, string>) => {
+    const configsToCompare = currentConfigs || configs;
+    const hasInitialData = Object.keys(configsToCompare).length > 0;
+
+    // 如果已有缓存数据，不显示loading，静默更新
+    if (!hasInitialData) {
+      setLoading(true);
+    }
+
+    try {
+      const configData = await getCachedConfigs();
+
+      // 只有在数据有变化时才更新
+      const hasDataChanged =
+        JSON.stringify(configData) !== JSON.stringify(configsToCompare);
+
+      if (hasDataChanged) {
+        setConfigs(configData);
+        setOriginalConfigs({ ...configData });
+        setHasChanges(false);
+      } else {
+      }
+    } catch {
+      // 只有在没有缓存数据时才显示错误
+      if (!hasInitialData) {
+        toast.error("加载配置出错，请重试");
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const loadStorageSummary = async () => {
+    try {
+      const response = await getStorageSummary();
+
+      if (response.code === 0 && response.data?.databaseSizeText) {
+        setStorageSummary(response.data.databaseSizeText);
+
+        return;
+      }
+      setStorageSummary("获取失败");
+    } catch {
+      setStorageSummary("获取失败");
+    }
+  };
+
+  const loadSystemUpgradeInfo = async (channel = updateChannel) => {
+    setSystemUpgradeLoading(true);
+    try {
+      const response = await getSystemUpgradeVersion();
+
+      if (response.code === 0 && response.data) {
+        setSystemUpgradeInfo({
+          ...response.data,
+          channel,
+          hasUpdate:
+            response.data.channel === channel ? response.data.hasUpdate : false,
+          latestVersion:
+            response.data.channel === channel
+              ? response.data.latestVersion
+              : "",
+        });
+      } else {
+        setSystemUpgradeInfo(null);
+      }
+    } catch {
+      setSystemUpgradeInfo(null);
+    } finally {
+      setSystemUpgradeLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      loadConfigs(initialConfigs);
+      loadAnnouncement();
+      loadStorageSummary();
+      void loadSystemUpgradeInfo();
+    }, 100);
+
+    return () => clearTimeout(timer);
+  }, []);
+
+  const loadAnnouncement = async () => {
+    setAnnouncementLoading(true);
+    try {
+      const res = await getAnnouncement();
+
+      if (res.code === 0 && res.data) {
+        setAnnouncement(res.data);
+      }
+    } catch {
+    } finally {
+      setAnnouncementLoading(false);
+    }
+  };
+
+  const saveAnnouncement = async () => {
+    setAnnouncementSaving(true);
+    try {
+      const res = await updateAnnouncement(announcement);
+
+      if (res.code === 0) {
+        toast.success("公告保存成功");
+      } else {
+        toast.error(res.msg || "保存失败");
+      }
+    } catch {
+      toast.error("保存公告失败，请重试");
+    } finally {
+      setAnnouncementSaving(false);
+    }
+  };
+
+  const handleCheckSystemUpgrade = async () => {
+    const channel = updateChannel;
+
+    setSystemUpgradeChecking(true);
+    try {
+      const response = await checkSystemUpgrade(channel);
+
+      if (response.code === 0 && response.data) {
+        const data = response.data as SystemUpgradeCheckApiData;
+
+        setSystemUpgradeInfo(data);
+        setSystemUpgradeReleases(data.releases || []);
+        setSystemUpgradeCheckedChannel(channel);
+        setSystemUpgradeSelectedVersion("");
+        if (data.latestVersion && !data.hasUpdate) {
+          toast.success("当前已是最新版本");
+
+          return false;
+        }
+        toast.success(
+          data.latestVersion
+            ? `已检查到最新版本 ${data.latestVersion}`
+            : "未获取到可用版本",
+        );
+
+        return Boolean(
+          data.capability.capable && data.hasUpdate && data.releases?.length,
+        );
+      } else {
+        setSystemUpgradeReleases([]);
+        setSystemUpgradeCheckedChannel(null);
+        toast.error(response.msg || "检查更新失败");
+      }
+    } catch {
+      setSystemUpgradeReleases([]);
+      setSystemUpgradeCheckedChannel(null);
+      toast.error("检查更新失败，请重试");
+    } finally {
+      setSystemUpgradeChecking(false);
+    }
+
+    return false;
+  };
+
+  const handleOpenSystemUpgradeModal = async () => {
+    if (!canOpenSystemUpgradeModal) {
+      const checked = await handleCheckSystemUpgrade();
+
+      if (!checked) {
+        return;
+      }
+    }
+    setSystemUpgradeModalOpen(true);
+  };
+
+  const handleConfirmSystemUpgrade = async () => {
+    setSystemUpgradeExecuting(true);
+    try {
+      const response = await runSystemUpgrade(
+        systemUpgradeSelectedVersion || undefined,
+        updateChannel,
+      );
+
+      if (response.code === 0 && response.data) {
+        setSystemUpgradeModalOpen(false);
+        setSystemUpgradeSelectedVersion("");
+        toast.success("升级已开始，约 1 分钟后刷新页面", { duration: 8000 });
+      } else {
+        toast.error(response.msg || "面板升级失败");
+      }
+    } catch {
+      toast.error("面板升级失败，请重试");
+    } finally {
+      setSystemUpgradeExecuting(false);
+    }
+  };
+
+  const handleConfigChange = (key: string, value: string) => {
+    const newConfigs = { ...configs, [key]: value };
+
+    setConfigs(newConfigs);
+
+    if (isBrandPreviewKey(key)) {
+      setPreviewLoadFailed((prev) => ({ ...prev, [key]: false }));
+    }
+
+    const hasChangesNow =
+      Object.keys(newConfigs).some(
+        (k) => newConfigs[k] !== originalConfigs[k],
+      ) ||
+      Object.keys(originalConfigs).some(
+        (k) => originalConfigs[k] !== newConfigs[k],
+      );
+
+    setHasChanges(hasChangesNow);
+  };
+
+  // 保存配置
+  const handleSave = async () => {
+    const intervalValue = configs[TUNNEL_QUALITY_INTERVAL_CONFIG_KEY];
+    const intervalChanged =
+      intervalValue !== originalConfigs[TUNNEL_QUALITY_INTERVAL_CONFIG_KEY];
+    const intervalError = intervalChanged
+      ? validateTunnelQualityInterval(intervalValue || "")
+      : null;
+
+    if (intervalError) {
+      toast.error(intervalError);
+
+      return;
+    }
+
+    setSaving(true);
+    try {
+      const changedKeys = Object.keys(configs).filter(
+        (key) => configs[key] !== originalConfigs[key],
+      );
+
+      if (changedKeys.length === 0) {
+        setHasChanges(false);
+
+        return;
+      }
+
+      const changedPayload: Record<string, string> = {};
+
+      changedKeys.forEach((key) => {
+        changedPayload[key] = configs[key] || "";
+      });
+
+      const response = await updateConfigs(changedPayload);
+
+      if (response.code === 0) {
+        toast.success("配置保存成功");
+
+        Object.entries(configs).forEach(([key, value]) => {
+          configCache.set(key, value);
+        });
+
+        setOriginalConfigs({ ...configs });
+        setHasChanges(false);
+
+        if (
+          changedKeys.some((key) =>
+            [
+              "app_name",
+              "app_logo",
+              "app_favicon",
+              "app_bg_image",
+              "app_bg_image_light",
+              "app_bg_image_dark",
+              "login_bg_image",
+            ].includes(key),
+          )
+        ) {
+          await updateSiteConfig(configs);
+        }
+
+        // 触发配置更新事件，通知其他组件
+        window.dispatchEvent(
+          new CustomEvent("configUpdated", {
+            detail: { changedKeys },
+          }),
+        );
+
+        // 如果隧道质量检测配置变更，通知 tunnel-monitor-view
+        if (
+          changedKeys.some((key) =>
+            [
+              "monitor_tunnel_quality_enabled",
+              TUNNEL_QUALITY_INTERVAL_CONFIG_KEY,
+            ].includes(key),
+          )
+        ) {
+          window.dispatchEvent(
+            new CustomEvent("monitorTunnelQualityEnabledChanged", {
+              detail: {
+                enabled: configs["monitor_tunnel_quality_enabled"] === "true",
+                intervalSec: parseTunnelQualityIntervalSeconds(
+                  configs[TUNNEL_QUALITY_INTERVAL_CONFIG_KEY],
+                ),
+              },
+            }),
+          );
+        }
+      } else {
+        toast.error("保存配置失败: " + response.msg);
+      }
+    } catch {
+      toast.error("保存配置出错，请重试");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // 检查配置项是否应该显示（依赖检查）
+  const shouldShowItem = (item: ConfigItem): boolean => {
+    // 品牌设置项在单独的卡片中展示
+    if (
+      ["app_name", "app_logo", "app_favicon", "hide_footer_brand"].includes(
+        item.key,
+      )
+    ) {
+      return false;
+    }
+
+    if (!item.dependsOn || !item.dependsValue) {
+      return true;
+    }
+
+    return configs[item.dependsOn] === item.dependsValue;
+  };
+
+  const getBrandInputRef = (key: BrandPreviewKey) => {
+    return key === "app_logo" ? logoFileInputRef : faviconFileInputRef;
+  };
+
+  const triggerBrandFilePicker = (key: BrandPreviewKey) => {
+    if (brandUploading[key]) {
+      return;
+    }
+
+    getBrandInputRef(key).current?.click();
+  };
+
+  const clearBrandAsset = (key: BrandPreviewKey) => {
+    handleConfigChange(key, "");
+    setPreviewLoadFailed((prev) => ({ ...prev, [key]: false }));
+  };
+
+  const handleBrandFileChange = async (
+    key: BrandPreviewKey,
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+
+    if (!file) {
+      return;
+    }
+
+    setBrandUploading((prev) => ({ ...prev, [key]: true }));
+
+    try {
+      const pngDataURL = await convertBrandAssetToPngDataURL(
+        file,
+        toBrandAssetKind(key),
+      );
+
+      handleConfigChange(key, pngDataURL);
+      toast.success(key === "app_logo" ? "Logo 上传成功" : "Favicon 上传成功");
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "图片处理失败，请重试";
+
+      toast.error(message);
+    } finally {
+      setBrandUploading((prev) => ({ ...prev, [key]: false }));
+      event.target.value = "";
+    }
+  };
+
+  const handleBgImageUpload = async (
+    e: React.ChangeEvent<HTMLInputElement>,
+    key: BgImageKey,
+  ) => {
+    const file = e.target.files?.[0];
+
+    if (!file) return;
+
+    if (!file.type.startsWith("image/")) {
+      toast.error("只能上传图片文件");
+
+      return;
+    }
+
+    setBgImageUploading(key);
+    try {
+      const compressedImage = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+
+        reader.onload = (event) => {
+          const img = new Image();
+
+          img.onload = () => {
+            const canvas = document.createElement("canvas");
+            let width = img.width;
+            let height = img.height;
+            const MAX_WIDTH = 1920;
+            const MAX_HEIGHT = 1080;
+
+            if (width > height) {
+              if (width > MAX_WIDTH) {
+                height = Math.round((height * MAX_WIDTH) / width);
+                width = MAX_WIDTH;
+              }
+            } else {
+              if (height > MAX_HEIGHT) {
+                width = Math.round((width * MAX_HEIGHT) / height);
+                height = MAX_HEIGHT;
+              }
+            }
+
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext("2d");
+
+            if (!ctx) {
+              reject(new Error("Canvas context is null"));
+
+              return;
+            }
+            ctx.drawImage(img, 0, 0, width, height);
+
+            // Output as webp for better compression
+            const dataUrl = canvas.toDataURL("image/webp", 0.8);
+
+            resolve(dataUrl);
+          };
+          img.onerror = () => reject(new Error("图片加载失败"));
+          img.src = event.target?.result as string;
+        };
+        reader.onerror = () => reject(new Error("文件读取失败"));
+        reader.readAsDataURL(file);
+      });
+
+      handleConfigChange(key, compressedImage);
+      toast.success("壁纸上传成功，保存配置后生效");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "图片处理失败");
+    } finally {
+      setBgImageUploading(null);
+      e.target.value = "";
+    }
+  };
+
+  const renderBgImageUploader = (key: BgImageKey, label: string) => {
+    const bgImage = configs[key] || "";
+    const isDefault = key === "app_bg_image";
+    const isImage =
+      bgImage.startsWith("http") ||
+      bgImage.startsWith("data:") ||
+      bgImage.startsWith("/") ||
+      bgImage.startsWith("blob:");
+    const isTheme = bgImage === "theme";
+    const isWallpaper = bgImage === "wallpaper";
+    const isSolidColor = bgImage && !isImage && !isTheme && !isWallpaper;
+
+    return (
+      <div className="flex flex-col gap-3 w-full rounded-xl border border-divider bg-white dark:bg-zinc-900 p-4">
+        <div>
+          <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
+            {label}
+          </p>
+          {!isDefault && !bgImage && (
+            <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              未单独设置，使用默认背景
+            </p>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-4">
+          <input
+            ref={(node) => {
+              if (node) bgImageFileInputRefs.current[key] = node;
+            }}
+            accept="image/*"
+            className="hidden"
+            type="file"
+            onChange={(event) => void handleBgImageUpload(event, key)}
+          />
+          <Button
+            color="primary"
+            isDisabled={bgImageUploading !== null && bgImageUploading !== key}
+            isLoading={bgImageUploading === key}
+            variant="flat"
+            onPress={() => bgImageFileInputRefs.current[key]?.click()}
+          >
+            上传图片
+          </Button>
+          {isDefault && (
+            <Button
+              color="secondary"
+              isDisabled={bgImageUploading !== null || isWallpaper}
+              variant="flat"
+              onPress={() => handleConfigChange(key, "wallpaper")}
+            >
+              内置壁纸
+            </Button>
+          )}
+          {isDefault && (
+            <Button
+              color="default"
+              isDisabled={bgImageUploading !== null || bgImage === "#ffffff"}
+              variant="flat"
+              onPress={() => handleConfigChange(key, "#ffffff")}
+            >
+              白色纯色
+            </Button>
+          )}
+          {bgImage && (
+            <Button
+              color="danger"
+              isDisabled={bgImageUploading !== null}
+              variant="flat"
+              onPress={() => handleConfigChange(key, "")}
+            >
+              {isDefault ? "恢复默认纯色" : "清除专属壁纸"}
+            </Button>
+          )}
+        </div>
+
+        {bgImage && isImage && (
+          <div className="relative rounded-xl overflow-hidden border border-divider">
+            <img
+              alt={`${label}预览`}
+              className="w-full max-h-48 object-cover opacity-80"
+              src={bgImage}
+            />
+            <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent flex items-end p-4">
+              <span className="text-white text-sm font-medium">预览效果</span>
+            </div>
+          </div>
+        )}
+
+        {bgImage && isWallpaper && (
+          <div className="relative rounded-xl border border-divider bg-background h-32 flex items-center justify-center">
+            <span className="text-foreground text-sm font-medium">
+              当前为内置壁纸（亮色 / 暗色各一张）
+            </span>
+          </div>
+        )}
+
+        {bgImage && isTheme && (
+          <div className="relative rounded-xl border border-divider bg-background h-32 flex items-center justify-center">
+            <span className="text-foreground text-sm font-medium">
+              当前为自适应纯色背景
+            </span>
+          </div>
+        )}
+
+        {bgImage && isSolidColor && (
+          <div
+            className="relative rounded-xl border border-divider h-32 flex items-center justify-center"
+            style={{ backgroundColor: bgImage }}
+          >
+            <span className="text-gray-500 bg-white dark:bg-zinc-900 px-2 py-1 rounded text-sm font-medium border border-gray-200 dark:border-gray-800 shadow-sm">
+              纯色背景 ({bgImage})
+            </span>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderBrandPreview = (key: BrandPreviewKey) => {
+    const previewUrl = (configs[key] || "").trim();
+    const appNamePreview = (configs.app_name || "").trim() || "应用名称";
+    const failed = previewLoadFailed[key] === true;
+    const showImage = previewUrl.length > 0 && !failed;
+
+    return (
+      <div className="mt-3 rounded-lg border border-default-200 dark:border-default-100/30 bg-default-50/60 dark:bg-default-100/10 p-3">
+        <p className="text-xs text-default-500">实时预览</p>
+        <div className="mt-2 rounded-md border border-default-200 dark:border-default-100/30 bg-white dark:bg-black px-3 py-2">
+          {key === "app_logo" ? (
+            <div className="flex h-10 items-center gap-2">
+              {showImage ? (
+                <img
+                  alt="logo preview"
+                  className="h-7 w-7 rounded-sm border border-default-200 object-cover dark:border-default-100/30"
+                  src={previewUrl}
+                  onError={() =>
+                    setPreviewLoadFailed((prev) => ({ ...prev, [key]: true }))
+                  }
+                  onLoad={() =>
+                    setPreviewLoadFailed((prev) => ({ ...prev, [key]: false }))
+                  }
+                />
+              ) : (
+                <div className="flex h-7 w-7 items-center justify-center rounded-sm bg-default-200 text-[10px] font-semibold text-default-600 dark:bg-default-700 dark:text-default-200">
+                  LOGO
+                </div>
+              )}
+              <span className="truncate text-sm font-semibold text-foreground">
+                {appNamePreview}
+              </span>
+            </div>
+          ) : (
+            <div className="flex h-7 max-w-[260px] items-center gap-2 rounded border border-default-200 bg-default-100/70 px-2 dark:border-default-100/30 dark:bg-default-100/20">
+              {showImage ? (
+                <img
+                  alt="favicon preview"
+                  className="h-4 w-4 rounded-sm object-contain"
+                  src={previewUrl}
+                  onError={() =>
+                    setPreviewLoadFailed((prev) => ({ ...prev, [key]: true }))
+                  }
+                  onLoad={() =>
+                    setPreviewLoadFailed((prev) => ({ ...prev, [key]: false }))
+                  }
+                />
+              ) : (
+                <div className="h-4 w-4 rounded-sm bg-default-300 dark:bg-default-600" />
+              )}
+              <span className="truncate text-xs text-default-700 dark:text-default-300">
+                {appNamePreview}
+              </span>
+            </div>
+          )}
+        </div>
+
+        {previewUrl.length === 0 ? (
+          <p className="mt-2 text-xs text-default-500">
+            上传图片后会实时显示预览
+          </p>
+        ) : null}
+
+        {previewUrl.length > 0 && failed ? (
+          <p className="mt-2 text-xs text-danger">图片加载失败，请重新上传</p>
+        ) : null}
+
+        {previewUrl.length > 0 && !isPngDataURL(previewUrl) ? (
+          <p className="mt-2 text-xs text-warning-600 dark:text-warning-400">
+            当前是旧版 URL 配置，建议重新上传图片以启用无闪烁加载
+          </p>
+        ) : null}
+      </div>
+    );
+  };
+
+  const renderBrandAssetUploader = (
+    key: BrandPreviewKey,
+    isChanged: boolean,
+  ) => {
+    const value = (configs[key] || "").trim();
+    const uploading = brandUploading[key] === true;
+    const isLogo = key === "app_logo";
+
+    return (
+      <div
+        className={`rounded-lg border p-3 ${
+          isChanged
+            ? "border-warning-300"
+            : "border-default-200 dark:border-default-100/30"
+        }`}
+      >
+        <input
+          ref={getBrandInputRef(key)}
+          accept={BRAND_FILE_ACCEPT}
+          className="hidden"
+          disabled={uploading}
+          type="file"
+          onChange={(event) => {
+            void handleBrandFileChange(key, event);
+          }}
+        />
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            color="primary"
+            isLoading={uploading}
+            size="sm"
+            variant="flat"
+            onPress={() => triggerBrandFilePicker(key)}
+          >
+            {value.length > 0
+              ? isLogo
+                ? "替换 Logo"
+                : "替换 Favicon"
+              : isLogo
+                ? "上传 Logo"
+                : "上传 Favicon"}
+          </Button>
+          <Button
+            isDisabled={value.length === 0 || uploading}
+            size="sm"
+            variant="light"
+            onPress={() => clearBrandAsset(key)}
+          >
+            清除
+          </Button>
+          <span className="text-xs text-default-500">
+            仅支持图片文件，自动转换为 PNG
+          </span>
+        </div>
+
+        <p className="mt-2 text-xs text-default-500">
+          {isLogo
+            ? "建议上传方形图片，系统会统一转换为 96x96 PNG"
+            : "建议上传方形图片，系统会统一转换为 64x64 PNG"}
+        </p>
+
+        {renderBrandPreview(key)}
+      </div>
+    );
+  };
+
+  // 渲染不同类型的配置项
+  const renderConfigItem = (item: ConfigItem) => {
+    const isChanged =
+      hasChanges && configs[item.key] !== originalConfigs[item.key];
+
+    switch (item.type) {
+      case "bg_image":
+        // 登录页壁纸：单个上传器；主界面壁纸：默认+亮色/暗色三个上传器
+        if (item.key === "login_bg_image") {
+          return renderBgImageUploader("login_bg_image", item.label);
+        }
+        return (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="lg:col-span-2">
+              {renderBgImageUploader("app_bg_image", "默认背景")}
+            </div>
+            {renderBgImageUploader("app_bg_image_light", "☀️ 亮色模式壁纸")}
+            {renderBgImageUploader("app_bg_image_dark", "🌙 暗色模式壁纸")}
+          </div>
+        );
+
+      case "input": {
+        if (isBrandPreviewKey(item.key)) {
+          return renderBrandAssetUploader(item.key, isChanged);
+        }
+
+        const isTunnelQualityInterval =
+          item.key === TUNNEL_QUALITY_INTERVAL_CONFIG_KEY;
+        const intervalValue = isTunnelQualityInterval
+          ? (configs[item.key] ?? String(DEFAULT_TUNNEL_QUALITY_INTERVAL_SEC))
+          : (configs[item.key] ?? "");
+        const intervalError =
+          isTunnelQualityInterval && configs[item.key] !== undefined
+            ? validateTunnelQualityInterval(intervalValue)
+            : null;
+
+        return (
+          <Input
+            classNames={{
+              input: "text-sm",
+              inputWrapper: isChanged
+                ? "border-warning-300 data-[hover=true]:border-warning-400"
+                : "",
+            }}
+            endContent={isTunnelQualityInterval ? "秒" : undefined}
+            errorMessage={intervalError || undefined}
+            isInvalid={Boolean(intervalError)}
+            max={
+              isTunnelQualityInterval
+                ? MAX_TUNNEL_QUALITY_INTERVAL_SEC
+                : undefined
+            }
+            min={
+              isTunnelQualityInterval
+                ? MIN_TUNNEL_QUALITY_INTERVAL_SEC
+                : undefined
+            }
+            placeholder={item.placeholder}
+            size="md"
+            step={isTunnelQualityInterval ? 1 : undefined}
+            type={isTunnelQualityInterval ? "number" : "text"}
+            value={intervalValue}
+            variant="bordered"
+            onChange={(e) => handleConfigChange(item.key, e.target.value)}
+          />
+        );
+      }
+
+      case "switch":
+        return (
+          <Switch
+            classNames={{
+              wrapper: isChanged ? "border-warning-300" : "",
+            }}
+            isSelected={configs[item.key] === "true"}
+            size="sm"
+            onValueChange={(checked) =>
+              handleConfigChange(item.key, checked ? "true" : "false")
+            }
+          >
+            <span className="text-sm text-gray-700 dark:text-gray-300">
+              {configs[item.key] === "true" ? "已启用" : "已禁用"}
+            </span>
+          </Switch>
+        );
+
+      case "select":
+        return (
+          <Select
+            classNames={{
+              trigger: isChanged
+                ? "border-warning-300 data-[hover=true]:border-warning-400"
+                : "",
+            }}
+            placeholder="请选择验证码类型"
+            selectedKeys={configs[item.key] ? [configs[item.key]] : []}
+            size="md"
+            variant="bordered"
+            onSelectionChange={(keys) => {
+              const selectedKey = Array.from(keys)[0] as string;
+
+              if (selectedKey) {
+                handleConfigChange(item.key, selectedKey);
+              }
+            }}
+          >
+            {item.options?.map((option) => (
+              <SelectItem key={option.value} description={option.description}>
+                {option.label}
+              </SelectItem>
+            )) || []}
+          </Select>
+        );
+
+      default:
+        return null;
+    }
+  };
+
+  const handleExport = async () => {
+    if (exportTypes.length === 0) {
+      toast.error("请至少选择一种数据类型");
+
+      return;
+    }
+    setExporting(true);
+    try {
+      await exportBackup(exportTypes);
+      toast.success("导出成功");
+      setExportSelectorOpen(false);
+    } catch {
+      toast.error("导出失败，请重试");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const triggerImportFilePicker = () => {
+    if (importTypes.length === 0) {
+      toast.error("请先选择要导入的数据类型");
+
+      return;
+    }
+
+    setImportSelectorOpen(false);
+    requestAnimationFrame(() => backupFileInputRef.current?.click());
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+
+    if (!file) return;
+
+    if (importTypes.length === 0) {
+      toast.error("请先选择要导入的数据类型");
+
+      return;
+    }
+
+    setImportFileName(file.name);
+    setImporting(true);
+
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+
+      const response = await importBackup({
+        types: importTypes,
+        ...data,
+      });
+
+      if (response.code === 0) {
+        toast.success(`导入成功: ${JSON.stringify(response.data)}`);
+        setImportTypes([]);
+        setImportFileName("");
+      } else {
+        toast.error("导入失败: " + response.msg);
+      }
+    } catch {
+      toast.error("导入失败，请检查文件格式");
+    } finally {
+      setImporting(false);
+      if (backupFileInputRef.current) {
+        backupFileInputRef.current.value = "";
+      }
+    }
+  };
+
+  const toggleTypeSelection = (
+    type: string,
+    setTypes: React.Dispatch<React.SetStateAction<string[]>>,
+  ) => {
+    setTypes((prev) =>
+      prev.includes(type)
+        ? prev.filter((item) => item !== type)
+        : [...prev, type],
+    );
+  };
+
+  const isAllTypesSelected = (types: string[]) =>
+    BACKUP_TYPE_VALUES.every((type) => types.includes(type));
+
+  const renderTypeSelection = (
+    label: string,
+    selectedTypes: string[],
+    setTypes: React.Dispatch<React.SetStateAction<string[]>>,
+  ) => {
+    const allSelected = isAllTypesSelected(selectedTypes);
+
+    return (
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-sm font-medium text-default-700 dark:text-default-300">
+            {label}
+          </span>
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="flat"
+              onPress={() =>
+                setTypes(allSelected ? [] : [...BACKUP_TYPE_VALUES])
+              }
+            >
+              {allSelected ? "取消全选" : "全选"}
+            </Button>
+            <Button size="sm" variant="light" onPress={() => setTypes([])}>
+              清空
+            </Button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          {BACKUP_TYPE_OPTIONS.map((option) => {
+            const isSelected = selectedTypes.includes(option.value);
+
+            return (
+              <button
+                key={option.value}
+                aria-pressed={isSelected}
+                className={`w-full px-4 py-3 rounded-lg border transition-all duration-200 cursor-pointer text-left ${
+                  isSelected
+                    ? "bg-primary-50 dark:bg-primary-900/20 border-primary-300 dark:border-primary-500/50 shadow-sm"
+                    : "bg-white dark:bg-default-50 border-default-200 dark:border-default-100/30 hover:border-primary-200 dark:hover:border-primary-500/30 hover:shadow-sm"
+                }`}
+                type="button"
+                onClick={() => toggleTypeSelection(option.value, setTypes)}
+              >
+                <div className="flex items-center gap-3">
+                  <Checkbox
+                    classNames={{
+                      base: "pointer-events-none",
+                    }}
+                    color="primary"
+                    isSelected={isSelected}
+                    size="md"
+                  />
+                  <span
+                    className={`font-medium ${
+                      isSelected
+                        ? "text-default-900 dark:text-default-100"
+                        : "text-default-700 dark:text-default-500"
+                    }`}
+                  >
+                    {option.label}
+                  </span>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-[400px]">
+        <Spinner label="加载配置中..." size="lg" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6 max-w-4xl mx-auto">
+      {/* 页面标题 */}
+      <div className="flex items-center gap-3 mb-6">
+        <Button
+          isIconOnly
+          aria-label="返回上一页"
+          className="min-w-0 w-9 h-9"
+          size="sm"
+          variant="flat"
+          onPress={handleBack}
+        >
+          <BackIcon className="w-5 h-5" />
+        </Button>
+        <SettingsIcon className="w-8 h-8 text-primary" />
+        <div>
+          <h1 className="text-2xl font-bold">网站配置</h1>
+          <p className="text-gray-600 dark:text-gray-400">
+            管理网站的基本信息和显示设置
+          </p>
+        </div>
+      </div>
+
+      <Card className="shadow-md mb-6">
+        <CardHeader className="pb-6">
+          <div className="flex items-center w-full">
+            <div>
+              <h2 className="text-xl font-semibold">品牌设置</h2>
+              <p className="text-sm text-gray-600 dark:text-gray-400">
+                自定义面板名称、Logo、网站图标和底部版权信息
+              </p>
+            </div>
+          </div>
+        </CardHeader>
+        <Divider />
+        <CardBody className="pt-8">
+          <div className="space-y-6">
+            {CONFIG_ITEMS.filter((item) =>
+              [
+                "app_name",
+                "app_logo",
+                "app_favicon",
+                "hide_footer_brand",
+              ].includes(item.key),
+            ).map((item, index) => (
+              <div key={item.key}>
+                <div className="grid grid-cols-1 gap-6 md:grid-cols-[1fr_2fr]">
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">
+                      {item.label}
+                    </label>
+                    {item.description && (
+                      <p className="text-xs text-gray-500 dark:text-gray-400">
+                        {item.description}
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex items-start">
+                    {renderConfigItem(item)}
+                  </div>
+                </div>
+                {index < 3 && <Divider className="mt-6" />}
+              </div>
+            ))}
+          </div>
+        </CardBody>
+      </Card>
+
+      <Card className="shadow-md">
+        <CardHeader className="pb-6">
+          <div className="flex items-center w-full">
+            <div>
+              <h2 className="text-xl font-semibold">基本设置</h2>
+              <p className="text-sm text-gray-600 dark:text-gray-400">
+                配置网站的基本信息，这些设置会影响网站的显示效果
+              </p>
+            </div>
+          </div>
+        </CardHeader>
+
+        <Divider />
+
+        <CardBody className="space-y-6 pt-8 md:pt-8">
+          {CONFIG_ITEMS.map((item, index) => {
+            // 检查配置项是否应该显示
+            if (!shouldShowItem(item)) {
+              return null;
+            }
+
+            // 计算是否是最后一个显示的项目（用于决定是否显示分隔线）
+            const remainingItems = CONFIG_ITEMS.slice(index + 1).filter(
+              shouldShowItem,
+            );
+            const isLastItem = remainingItems.length === 0;
+
+            return (
+              <div key={item.key} className="space-y-3">
+                <div className="flex flex-col gap-1">
+                  <label className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                    {item.label}
+                  </label>
+                  {item.description && (
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      {item.description}
+                    </p>
+                  )}
+                </div>
+
+                {/* 渲染配置项 */}
+                {renderConfigItem(item)}
+
+                {/* 分隔线 */}
+                {!isLastItem && <Divider className="mt-6" />}
+              </div>
+            );
+          })}
+
+          <Divider className="my-2" />
+
+          <div className="space-y-3">
+            <div className="flex flex-col gap-1">
+              <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                数据库占用
+              </p>
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                当前后端数据库文件或实例占用空间，仅用于容量参考。
+              </p>
+            </div>
+            <div className="rounded-lg border border-divider bg-default-50/60 dark:bg-default-100/10 px-4 py-3 text-sm font-semibold text-default-800 dark:text-default-200">
+              {storageSummary}
+            </div>
+          </div>
+
+          <Divider className="my-2" />
+
+          <div className="space-y-4 rounded-xl border border-divider bg-white dark:bg-zinc-900 p-4">
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                面板自升级
+              </p>
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                检查当前版本、可用发布并在容器环境中触发面板升级。
+              </p>
+            </div>
+
+            {systemUpgradeLoading ? (
+              <div className="flex items-center gap-2 rounded-lg border border-divider bg-background px-4 py-3 text-sm text-default-500">
+                <Spinner size="sm" />
+                正在加载升级状态...
+              </div>
+            ) : (
+              <div className="space-y-4 rounded-lg border border-divider bg-background px-4 py-4 text-sm text-default-700 dark:text-default-300">
+                <div className="grid gap-3 md:grid-cols-2">
+                  <div>
+                    <p className="text-xs text-default-500">当前版本</p>
+                    <p className="mt-1 font-medium">
+                      {systemUpgradeInfo?.currentVersion || "未获取到版本信息"}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-default-500">最新版本</p>
+                    <p className="mt-1 font-medium">
+                      {systemUpgradeInfo?.latestVersion || "未获取到可用版本"}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-default-500">升级能力</p>
+                    <p className="mt-1 font-medium">
+                      {systemUpgradeInfo?.capability.capable
+                        ? "可升级"
+                        : "当前不可升级"}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2">
+                  <div>
+                    <p className="text-xs text-default-500">部署目录</p>
+                    <p className="mt-1 break-all font-medium">
+                      {systemUpgradeInfo?.capability.deployDir ||
+                        "未获取到部署目录"}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-default-500">后端容器</p>
+                    <p className="mt-1 break-all font-medium">
+                      {systemUpgradeInfo?.capability.backendContainer ||
+                        "未获取到容器信息"}
+                    </p>
+                  </div>
+                </div>
+
+                {!systemUpgradeInfo?.capability.capable && (
+                  <div className="rounded-lg border border-warning-200 bg-warning-50 px-4 py-3 text-warning-800 dark:border-warning-900/40 dark:bg-warning-950/30 dark:text-warning-200">
+                    <p className="text-xs font-medium">当前无法升级</p>
+                    <ul className="mt-2 list-disc space-y-1 pl-4 text-xs">
+                      {(systemUpgradeInfo?.capability.reasons?.length
+                        ? systemUpgradeInfo.capability.reasons
+                        : ["暂未获取到不可升级原因"]
+                      ).map((reason) => (
+                        <li key={reason}>{reason}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                <div className="space-y-3">
+                  <div className="flex flex-col gap-1">
+                    <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
+                      可用发布版本
+                    </p>
+                    <p className="text-xs text-gray-500 dark:text-gray-400">
+                      选择指定版本后执行升级；留空则使用当前通道下最新可用版本。
+                    </p>
+                  </div>
+
+                  <Select
+                    aria-label="目标版本"
+                    isDisabled={
+                      !systemUpgradeReleasesMatchChannel ||
+                      systemUpgradeReleases.length === 0 ||
+                      systemUpgradeExecuting
+                    }
+                    placeholder={
+                      systemUpgradeReleasesMatchChannel &&
+                      systemUpgradeReleases.length > 0
+                        ? "留空时自动选择最新版本"
+                        : "请先检查当前通道更新"
+                    }
+                    selectedKeys={
+                      systemUpgradeSelectedVersion
+                        ? [systemUpgradeSelectedVersion]
+                        : []
+                    }
+                    size="md"
+                    variant="bordered"
+                    onSelectionChange={(keys) => {
+                      const selected = Array.from(keys)[0] as
+                        | string
+                        | undefined;
+
+                      setSystemUpgradeSelectedVersion(selected || "");
+                    }}
+                  >
+                    {(systemUpgradeReleasesMatchChannel
+                      ? systemUpgradeReleases
+                      : []
+                    ).map((release) => (
+                      <SelectItem
+                        key={release.version}
+                        description={release.publishedAt || "暂无发布时间"}
+                      >
+                        {release.name || release.version}
+                      </SelectItem>
+                    ))}
+                  </Select>
+                </div>
+              </div>
+            )}
+
+            <div className="flex flex-col gap-3 pt-1 sm:flex-row sm:justify-end">
+              <Button
+                isLoading={systemUpgradeChecking}
+                variant="flat"
+                onPress={handleCheckSystemUpgrade}
+              >
+                检查更新
+              </Button>
+              <Button
+                color="primary"
+                isDisabled={!canTriggerSystemUpgrade}
+                isLoading={systemUpgradeExecuting}
+                onPress={handleOpenSystemUpgradeModal}
+              >
+                立即升级
+              </Button>
+            </div>
+          </div>
+
+          <div className="flex justify-end pt-6 border-t border-divider/50 mt-4">
+            <Button
+              color="primary"
+              disabled={!hasChanges}
+              isLoading={saving}
+              startContent={<SaveIcon className="w-4 h-4" />}
+              onPress={handleSave}
+            >
+              {saving ? "保存中..." : "保存配置"}
+            </Button>
+          </div>
+        </CardBody>
+      </Card>
+
+      <NotifyCard
+        configs={configs}
+        originalConfigs={originalConfigs}
+        onChange={handleConfigChange}
+      />
+
+      {/* 主题设置 */}
+      <div className="mt-6">
+        <ThemeSettings />
+      </div>
+
+      {hasChanges && (
+        <Card className="mt-4 bg-warning-50 dark:bg-warning-900/20 border-warning-200 dark:border-warning-800 shadow-sm overflow-hidden">
+          <div className="h-10 flex items-center justify-center gap-2 text-warning-700 dark:text-warning-300">
+            <div className="w-2 h-2 bg-warning-500 rounded-full animate-pulse flex-shrink-0" />
+            <span className="text-sm font-medium leading-none">
+              检测到配置变更，请记得保存您的修改
+            </span>
+          </div>
+        </Card>
+      )}
+
+      <Card className="mt-6 shadow-md">
+        <CardHeader className="pb-6">
+          <div className="flex justify-between items-center w-full">
+            <div>
+              <h2 className="text-xl font-semibold">公告管理</h2>
+              <p className="text-sm text-gray-600 dark:text-gray-400">
+                设置首页显示的公告内容
+              </p>
+            </div>
+          </div>
+        </CardHeader>
+
+        <Divider />
+
+        <CardBody className="space-y-4 pt-8 md:pt-8">
+          {announcementLoading ? (
+            <div className="flex justify-center py-8">
+              <Spinner size="lg" />
+            </div>
+          ) : (
+            <>
+              <div className="space-y-2">
+                <Switch
+                  isSelected={announcement.enabled === 1}
+                  onValueChange={(checked) =>
+                    setAnnouncement({
+                      ...announcement,
+                      enabled: checked ? 1 : 0,
+                    })
+                  }
+                >
+                  <span className="text-sm text-gray-700 dark:text-gray-300">
+                    {announcement.enabled === 1 ? "已启用" : "已禁用"}
+                  </span>
+                </Switch>
+                <p className="text-xs text-gray-500 dark:text-gray-400">
+                  启用后，公告将在首页顶部显示
+                </p>
+              </div>
+
+              <Textarea
+                label="公告内容"
+                minRows={4}
+                placeholder="支持 Markdown，例如：**加粗**、[链接](https://example.com)、- 列表"
+                value={announcement.content}
+                variant="bordered"
+                onChange={(e) =>
+                  setAnnouncement({ ...announcement, content: e.target.value })
+                }
+              />
+              <p className="text-xs text-gray-500 dark:text-gray-400">
+                公告支持 Markdown 语法，链接会在新标签页打开
+              </p>
+
+              <div className="flex justify-end mt-4 pt-4 border-t border-divider/50">
+                <Button
+                  color="primary"
+                  isLoading={announcementSaving}
+                  startContent={<SaveIcon className="w-4 h-4" />}
+                  onPress={saveAnnouncement}
+                >
+                  保存公告
+                </Button>
+              </div>
+            </>
+          )}
+        </CardBody>
+      </Card>
+
+      {/* 备份与恢复 */}
+      <Card className="mt-6 shadow-md">
+        <CardHeader className="pb-6">
+          <div className="flex justify-between items-center w-full">
+            <div>
+              <h2 className="text-xl font-semibold">数据备份与恢复</h2>
+              <p className="text-sm text-gray-600 dark:text-gray-400">
+                导出或导入系统数据，支持选择特定数据类型
+              </p>
+            </div>
+          </div>
+        </CardHeader>
+
+        <Divider />
+
+        <CardBody className="space-y-6 pt-8 md:pt-8">
+          {/* 导出部分 */}
+          <div className="space-y-4">
+            <h3 className="text-lg font-medium">导出数据</h3>
+            <p className="text-sm text-gray-600 dark:text-gray-400">
+              选择要导出的数据类型，导出为 JSON 格式文件
+            </p>
+            <p className="text-xs text-default-500">
+              当前已选 {exportTypes.length} / {BACKUP_TYPE_VALUES.length}
+            </p>
+
+            <div className="flex justify-end gap-3 pt-4">
+              <Button
+                color="primary"
+                isLoading={exporting}
+                onPress={() => setExportSelectorOpen(true)}
+              >
+                {exporting ? "导出中..." : "选择并导出"}
+              </Button>
+            </div>
+          </div>
+
+          <Divider />
+
+          {/* 导入部分 */}
+          <div className="space-y-4">
+            <h3 className="text-lg font-medium">导入数据</h3>
+            <p className="text-sm text-gray-600 dark:text-gray-400">
+              选择要导入的数据类型，支持从备份文件恢复数据
+            </p>
+            <p className="text-xs text-default-500">
+              当前已选 {importTypes.length} / {BACKUP_TYPE_VALUES.length}
+            </p>
+
+            <input
+              ref={backupFileInputRef}
+              accept=".json"
+              className="hidden"
+              type="file"
+              onChange={handleFileChange}
+            />
+
+            <div className="flex justify-end gap-3 pt-4">
+              <Button
+                color="primary"
+                isLoading={importing}
+                variant="flat"
+                onPress={() => setImportSelectorOpen(true)}
+              >
+                {importing ? "导入中..." : "选择并导入"}
+              </Button>
+              {importFileName && (
+                <span className="self-center text-sm text-gray-600 dark:text-gray-400">
+                  已选择: {importFileName}
+                </span>
+              )}
+            </div>
+          </div>
+        </CardBody>
+      </Card>
+
+      <Modal
+        backdrop="blur"
+        classNames={{
+          base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
+        }}
+        isOpen={exportSelectorOpen}
+        onOpenChange={setExportSelectorOpen}
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader>选择导出内容</ModalHeader>
+              <ModalBody>
+                {renderTypeSelection("导出内容", exportTypes, setExportTypes)}
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="light" onPress={onClose}>
+                  取消
+                </Button>
+                <Button
+                  color="primary"
+                  isLoading={exporting}
+                  onPress={handleExport}
+                >
+                  {exporting ? "导出中..." : "确认导出"}
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+
+      <Modal
+        backdrop="blur"
+        classNames={{
+          base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
+        }}
+        isOpen={importSelectorOpen}
+        onOpenChange={setImportSelectorOpen}
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader>选择导入内容</ModalHeader>
+              <ModalBody>
+                {renderTypeSelection("导入内容", importTypes, setImportTypes)}
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="light" onPress={onClose}>
+                  取消
+                </Button>
+                <Button
+                  color="primary"
+                  isDisabled={importTypes.length === 0}
+                  onPress={triggerImportFilePicker}
+                >
+                  下一步选择文件
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+
+      <Modal
+        backdrop="blur"
+        classNames={{
+          base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
+        }}
+        isOpen={systemUpgradeModalOpen}
+        onOpenChange={(open) => {
+          if (!systemUpgradeExecuting) {
+            setSystemUpgradeModalOpen(open);
+          }
+        }}
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader>确认面板升级</ModalHeader>
+              <ModalBody>
+                <div className="space-y-3 text-sm text-default-700 dark:text-default-300">
+                  <p>
+                    升级过程需要访问 Docker
+                    Socket，并会在短时间内中断当前面板服务。
+                  </p>
+                  <p>
+                    请确认已经允许面板管理容器与宿主机 Docker
+                    交互，并且可以接受升级期间的临时不可用。
+                  </p>
+                  <div className="space-y-2 rounded-lg border border-warning-200 bg-warning-50 px-4 py-3 text-warning-800 dark:border-warning-900/40 dark:bg-warning-950/30 dark:text-warning-200">
+                    <p className="text-xs font-medium">升级前请确认</p>
+                    <ul className="list-disc space-y-1 pl-4 text-xs">
+                      <li>Docker Socket 可用且挂载权限正常。</li>
+                      <li>当前面板允许短暂停止和重启。</li>
+                      <li>已选择正确的更新通道与目标版本。</li>
+                    </ul>
+                  </div>
+                </div>
+              </ModalBody>
+              <ModalFooter>
+                <Button
+                  isDisabled={systemUpgradeExecuting}
+                  variant="light"
+                  onPress={onClose}
+                >
+                  取消
+                </Button>
+                <Button
+                  color="primary"
+                  isDisabled={systemUpgradeExecuting}
+                  isLoading={systemUpgradeExecuting}
+                  onPress={handleConfirmSystemUpgrade}
+                >
+                  确认升级
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+
+      {/* Floating Save Button (FAB) */}
+      <AnimatePresence>
+        {hasChanges && (
+          <motion.div
+            animate={{ y: 0, opacity: 1 }}
+            className="fixed bottom-6 right-6 z-50"
+            exit={{ y: 100, opacity: 0 }}
+            initial={{ y: 100, opacity: 0 }}
+            transition={{ type: "spring", damping: 20, stiffness: 300 }}
+          >
+            <Button
+              isIconOnly
+              className="w-12 h-12 rounded-full shadow-lg"
+              color="primary"
+              isLoading={saving}
+              size="lg"
+              onPress={handleSave}
+            >
+              {!saving && <SaveIcon className="w-5 h-5" />}
+            </Button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}

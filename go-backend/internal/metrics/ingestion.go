@@ -1,0 +1,149 @@
+package metrics
+
+import (
+	"context"
+	"log"
+	"sync"
+	"time"
+
+	"go-backend/internal/monitoring"
+	"go-backend/internal/store/model"
+	"go-backend/internal/store/repo"
+)
+
+type SystemInfo struct {
+	Uptime           uint64  `json:"uptime"`
+	BytesReceived    uint64  `json:"bytes_received"`
+	BytesTransmitted uint64  `json:"bytes_transmitted"`
+	CPUUsage         float64 `json:"cpu_usage"`
+	MemoryUsage      float64 `json:"memory_usage"`
+	DiskUsage        float64 `json:"disk_usage"`
+	Load1            float64 `json:"load1"`
+	Load5            float64 `json:"load5"`
+	Load15           float64 `json:"load15"`
+	TCPConns         int64   `json:"tcp_conns"`
+	UDPConns         int64   `json:"udp_conns"`
+	NetInSpeed       int64   `json:"net_in_speed"`
+	NetOutSpeed      int64   `json:"net_out_speed"`
+}
+
+type IngestionService struct {
+	repo          *repo.Repository
+	nodeBuffer    []*model.NodeMetric
+	nodeBufferMu  sync.Mutex
+	flushInterval time.Duration
+}
+
+func NewIngestionService(repo *repo.Repository) *IngestionService {
+	return &IngestionService{
+		repo:          repo,
+		nodeBuffer:    make([]*model.NodeMetric, 0, 500),
+		flushInterval: 30 * time.Second,
+	}
+}
+
+func (s *IngestionService) Start(ctx context.Context) {
+	flushTicker := time.NewTicker(s.flushInterval)
+	defer flushTicker.Stop()
+
+	pruneTicker := time.NewTicker(1 * time.Hour)
+	defer pruneTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.flushNodeMetrics()
+			return
+		case <-flushTicker.C:
+			s.flushNodeMetrics()
+		case <-pruneTicker.C:
+			s.pruneMetrics()
+		}
+	}
+}
+
+func (s *IngestionService) RecordNodeMetric(nodeID int64, info SystemInfo) {
+	m := &model.NodeMetric{
+		NodeID:      nodeID,
+		Timestamp:   time.Now().UnixMilli(),
+		CPUUsage:    info.CPUUsage,
+		MemUsage:    info.MemoryUsage,
+		DiskUsage:   info.DiskUsage,
+		NetInBytes:  int64(info.BytesReceived),
+		NetOutBytes: int64(info.BytesTransmitted),
+		NetInSpeed:  info.NetInSpeed,
+		NetOutSpeed: info.NetOutSpeed,
+		Load1:       info.Load1,
+		Load5:       info.Load5,
+		Load15:      info.Load15,
+		TCPConns:    info.TCPConns,
+		UDPConns:    info.UDPConns,
+		Uptime:      int64(info.Uptime),
+	}
+
+	s.nodeBufferMu.Lock()
+	s.nodeBuffer = append(s.nodeBuffer, m)
+	shouldFlush := len(s.nodeBuffer) >= 200
+	s.nodeBufferMu.Unlock()
+
+	if shouldFlush {
+		go s.flushNodeMetrics()
+	}
+}
+
+func (s *IngestionService) flushNodeMetrics() {
+	s.nodeBufferMu.Lock()
+	if len(s.nodeBuffer) == 0 {
+		s.nodeBufferMu.Unlock()
+		return
+	}
+	buffer := s.nodeBuffer
+	s.nodeBuffer = make([]*model.NodeMetric, 0, 500)
+	s.nodeBufferMu.Unlock()
+
+	if s.repo == nil {
+		return
+	}
+	if err := s.repo.InsertNodeMetricBatch(buffer); err != nil {
+		log.Printf("monitoring write failed op=node_metric.flush count=%d err=%v", len(buffer), err)
+	}
+}
+
+func (s *IngestionService) pruneMetrics() {
+	s.pruneMetricsAt(time.Now())
+}
+
+func (s *IngestionService) retentionDaysFromConfig() int {
+	if s == nil || s.repo == nil {
+		return monitoring.DefaultMonitorRetentionDays
+	}
+	cfg, err := s.repo.GetConfigsByNames([]string{monitoring.ConfigMonitorRetentionDays})
+	if err != nil {
+		return monitoring.DefaultMonitorRetentionDays
+	}
+	return monitoring.MonitoringRetentionDaysFromConfigMap(cfg)
+}
+
+func (s *IngestionService) pruneMetricsAt(now time.Time) {
+	cutoff := now.Add(-time.Duration(s.retentionDaysFromConfig()) * 24 * time.Hour).UnixMilli()
+	if s.repo == nil {
+		return
+	}
+	if err := s.repo.PruneNodeMetrics(cutoff); err != nil {
+		log.Printf("monitoring prune failed op=node_metric cutoff=%d err=%v", cutoff, err)
+	}
+	if err := s.repo.PruneTunnelMetrics(cutoff); err != nil {
+		log.Printf("monitoring prune failed op=tunnel_metric cutoff=%d err=%v", cutoff, err)
+	}
+	if err := s.repo.PruneServiceMonitorResults(cutoff); err != nil {
+		log.Printf("monitoring prune failed op=service_monitor_result cutoff=%d err=%v", cutoff, err)
+	}
+}
+
+func (s *IngestionService) GetLatestMetric(nodeID int64) (*model.NodeMetric, error) {
+	return s.repo.GetLatestNodeMetric(nodeID)
+}
+
+func (s *IngestionService) GetMetrics(nodeID int64, startMs, endMs int64) ([]model.NodeMetric, error) {
+	return s.repo.GetNodeMetrics(nodeID, startMs, endMs)
+}
